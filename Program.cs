@@ -3,7 +3,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
-using HtmlAgilityPack;
 
 namespace RoomSchedule;
 
@@ -32,7 +31,8 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
-        Console.OutputEncoding = Encoding.UTF8;
+        try { Console.OutputEncoding = Encoding.UTF8; } catch { /* консоль без UTF-8 */ }
+
         var options = Options.Parse(args);
 
         string room = options.Room ?? Prompt("Введите номер кабинета: ");
@@ -240,66 +240,74 @@ internal static class Program
     }
 
     // ---------- Разбор расписания аудитории (табличный вид) ----------
+    //
+    // Берём фрагмент страницы начиная с id="table-container" (вид-таблица идёт
+    // в разметке после вида-карточек, поэтому карточки в выборку не попадают),
+    // затем по порядку идём по заголовкам дней и строкам занятий.
 
-    private static readonly Regex TimeRange = new(
-        @"(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})", RegexOptions.Compiled);
+    private static readonly Regex DayOrRow = new(
+        @"<h3\s+class=""h5 my-0"">(?<day>[^<]+)</h3>" +
+        @"|<tr[^>]*id=""week-(?<week>up|down|both)-container""[^>]*>(?<body>.*?)</tr>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+
+    private static readonly Regex CellTd = new(@"<td\b[^>]*>(.*?)</td>", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex CellTh = new(@"<th\b[^>]*>(.*?)</th>", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex SpanIn = new(@"<span\b[^>]*>(.*?)</span>", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex SmallMuted = new(@"<small\b[^>]*class=""[^""]*text-muted[^""]*""[^>]*>(.*?)</small>", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex TimeRange = new(@"(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})", RegexOptions.Compiled);
 
     private static List<Lesson> ParseRoomSchedule(string html)
     {
         var lessons = new List<Lesson>();
-        var doc = new HtmlDocument();
-        doc.LoadHtml(html);
 
-        var container = doc.GetElementbyId("table-container");
-        if (container is null) return lessons;
+        int tableStart = html.IndexOf("id=\"table-container\"", StringComparison.Ordinal);
+        string scope = tableStart >= 0 ? html[tableStart..] : html;
 
-        var dayCards = container.SelectNodes(
-            ".//div[contains(concat(' ',normalize-space(@class),' '),' card ')]");
-        if (dayCards is null) return lessons;
-
-        foreach (var card in dayCards)
+        DayOfWeek? currentDay = null;
+        foreach (Match m in DayOrRow.Matches(scope))
         {
-            var head = card.SelectSingleNode(".//div[contains(@class,'card-header')]//h3");
-            DayOfWeek? day = head is null ? null : ParseDay(Clean(head.InnerText));
-            if (day is null) continue;
-
-            var rows = card.SelectNodes(".//tbody/tr");
-            if (rows is null) continue;
-
-            foreach (var row in rows)
+            if (m.Groups["day"].Success)
             {
-                var th = row.SelectSingleNode("./th");
-                var tds = row.SelectNodes("./td");
-                if (th is null || tds is null || tds.Count < 5) continue;
-
-                var tm = TimeRange.Match(Clean(th.InnerText));
-                if (!tm.Success) continue;
-                var start = new TimeOnly(int.Parse(tm.Groups[1].Value), int.Parse(tm.Groups[2].Value));
-                var end = new TimeOnly(int.Parse(tm.Groups[3].Value), int.Parse(tm.Groups[4].Value));
-
-                WeekKind week = WeekFromId(row.GetAttributeValue("id", ""));
-
-                string roomTitle = Clean(tds[1].InnerText);
-                string group = Clean(tds[2].InnerText);
-
-                var subjNode = tds[3].SelectSingleNode(".//span");
-                string subject = Clean(subjNode?.InnerText ?? tds[3].InnerText);
-                var typeNode = tds[3].SelectSingleNode(".//small[contains(@class,'text-muted')]");
-                string type = Clean(typeNode?.InnerText ?? "");
-
-                string teacher = Clean(tds[4].InnerText);
-
-                lessons.Add(new Lesson(day.Value, start, end, week, subject, type, group, teacher, roomTitle));
+                currentDay = ParseDay(Text(m.Groups["day"].Value));
+                continue;
             }
+            if (currentDay is null) continue;
+
+            string body = m.Groups["body"].Value;
+
+            var thm = CellTh.Match(body);
+            if (!thm.Success) continue;
+            var tm = TimeRange.Match(Text(thm.Groups[1].Value));
+            if (!tm.Success) continue;
+            var start = new TimeOnly(int.Parse(tm.Groups[1].Value), int.Parse(tm.Groups[2].Value));
+            var end = new TimeOnly(int.Parse(tm.Groups[3].Value), int.Parse(tm.Groups[4].Value));
+
+            var tds = CellTd.Matches(body);
+            if (tds.Count < 5) continue;
+
+            WeekKind week = m.Groups["week"].Value switch
+            {
+                "up" => WeekKind.Up,
+                "down" => WeekKind.Down,
+                _ => WeekKind.Both,
+            };
+
+            string roomTitle = Text(tds[1].Groups[1].Value);
+            string group = Text(tds[2].Groups[1].Value);
+
+            string subjCell = tds[3].Groups[1].Value;
+            var sm = SpanIn.Match(subjCell);
+            string subject = Text(sm.Success ? sm.Groups[1].Value : subjCell);
+            var tym = SmallMuted.Match(subjCell);
+            string type = tym.Success ? Text(tym.Groups[1].Value) : "";
+
+            string teacher = Text(tds[4].Groups[1].Value);
+
+            lessons.Add(new Lesson(currentDay.Value, start, end, week, subject, type, group, teacher, roomTitle));
         }
 
         return lessons;
     }
-
-    private static WeekKind WeekFromId(string id) =>
-        id.Contains("week-up") ? WeekKind.Up
-        : id.Contains("week-down") ? WeekKind.Down
-        : WeekKind.Both;
 
     // ---------- Утилиты ----------
 
@@ -334,11 +342,21 @@ internal static class Program
         _ => "обе недели",
     };
 
-    private static string Norm(string s) =>
-        Clean(s).Replace(" ", "").ToLowerInvariant();
+    private static string Norm(string s) => Clean(s).Replace(" ", "").ToLowerInvariant();
 
-    private static string Clean(string s) =>
-        Regex.Replace(HtmlEntity.DeEntitize(s ?? "").Replace(' ', ' '), @"\s+", " ").Trim();
+    // Снимает теги и декодирует HTML-сущности, нормализует пробелы.
+    private static string Text(string html) => Clean(Decode(Regex.Replace(html ?? "", "<[^>]+>", " ")));
+
+    private static string Decode(string s)
+    {
+        s = s.Replace("&nbsp;", " ").Replace("&amp;", "&").Replace("&quot;", "\"")
+             .Replace("&laquo;", "«").Replace("&raquo;", "»").Replace("&mdash;", "—")
+             .Replace("&ndash;", "–").Replace("&#39;", "'").Replace("&apos;", "'")
+             .Replace("&lt;", "<").Replace("&gt;", ">");
+        return Regex.Replace(s, @"&#(\d+);", m => ((char)int.Parse(m.Groups[1].Value)).ToString());
+    }
+
+    private static string Clean(string s) => Regex.Replace(s ?? "", @"\s+", " ").Trim();
 
     private static string Dash(string s) => string.IsNullOrWhiteSpace(s) ? "—" : s;
 
