@@ -33,6 +33,36 @@ internal static class Program
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { /* консоль без UTF-8 */ }
 
+        bool interactive = args.Length == 0;
+        try
+        {
+            int code = await Run(args);
+            if (interactive) PressAnyKey();
+            return code;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Необработанная ошибка:");
+            Console.Error.WriteLine(ex);
+            if (interactive) PressAnyKey();
+            return 1;
+        }
+    }
+
+    private static void PressAnyKey()
+    {
+        try
+        {
+            Console.WriteLine();
+            Console.Write("Нажмите любую клавишу для выхода…");
+            Console.ReadKey(true);
+        }
+        catch { /* ввод недоступен (например, ввод перенаправлён) */ }
+    }
+
+    private static async Task<int> Run(string[] args)
+    {
         var options = Options.Parse(args);
 
         string room = options.Room ?? Prompt("Введите номер кабинета: ");
