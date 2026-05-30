@@ -1,3 +1,17 @@
+// Поиск текущего занятия в аудитории СПбГМТУ.
+//
+// На вход подаётся номер кабинета. Программа:
+//   1. загружает страницу https://www.smtu.ru/ru/listschedule/;
+//   2. читает с неё текущий день недели и тип недели (верхняя/нижняя) —
+//      они напечатаны прямо в заголовке («Сегодня: … Среда, нижняя неделя»);
+//   3. из встроенного на страницу JS-объекта `arRoom` сопоставляет номер
+//      кабинета с его внутренним id и hex-кодом;
+//   4. запрашивает расписание аудитории /viewschedule/room/{id}/{hex}/;
+//   5. в табличном представлении находит занятие, идущее в текущий момент,
+//      и выводит предмет, преподавателя и группу.
+//
+// Сторонних библиотек нет — только стандартная библиотека .NET.
+
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -6,13 +20,16 @@ using System.Text.RegularExpressions;
 
 namespace RoomSchedule;
 
-internal enum WeekKind { Up, Down, Both } // верхняя / нижняя / обе недели
+/// <summary>Тип недели в расписании.</summary>
+internal enum WeekKind { Up, Down, Both }
 
-internal sealed record RoomRef(string Building, string RoomId, string Title, string Hex)
+/// <summary>Аудитория: корпус, внутренний id, отображаемый номер и hex-ключ.</summary>
+internal sealed record Room(string Building, string Id, string Title, string Hex)
 {
-    public string Url => $"{Program.BaseUrl}/viewschedule/room/{RoomId}/{Hex}/";
+    public string ScheduleUrl => $"{SmtuClient.BaseUrl}/viewschedule/room/{Id}/{Hex}/";
 }
 
+/// <summary>Одно занятие из расписания аудитории.</summary>
 internal sealed record Lesson(
     DayOfWeek Day,
     TimeOnly Start,
@@ -21,127 +38,121 @@ internal sealed record Lesson(
     string Subject,
     string Type,
     string Group,
-    string Teacher,
-    string Room);
+    string Teacher);
 
 internal static class Program
 {
-    public const string BaseUrl = "https://www.smtu.ru";
-    private const string ListUrl = BaseUrl + "/ru/listschedule/";
-
     private static async Task<int> Main(string[] args)
     {
-        try { Console.OutputEncoding = Encoding.UTF8; } catch { /* консоль без UTF-8 */ }
+        // Чтобы кириллица в консоли Windows не превращалась в «?».
+        try { Console.OutputEncoding = Encoding.UTF8; } catch { /* терминал без UTF-8 */ }
 
         bool interactive = args.Length == 0;
         try
         {
             int code = await Run(args);
-            if (interactive) PressAnyKey();
+            if (interactive) WaitForKey();
             return code;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine();
-            Console.Error.WriteLine("Необработанная ошибка:");
+            Console.Error.WriteLine("Непредвиденная ошибка:");
             Console.Error.WriteLine(ex);
-            if (interactive) PressAnyKey();
+            if (interactive) WaitForKey();
             return 1;
         }
     }
 
-    private static void PressAnyKey()
-    {
-        try
-        {
-            Console.WriteLine();
-            Console.Write("Нажмите любую клавишу для выхода…");
-            Console.ReadKey(true);
-        }
-        catch { /* ввод недоступен (например, ввод перенаправлён) */ }
-    }
-
     private static async Task<int> Run(string[] args)
     {
-        var options = Options.Parse(args);
+        var opt = CliOptions.Parse(args);
 
-        string room = options.Room ?? Prompt("Введите номер кабинета: ");
-        if (string.IsNullOrWhiteSpace(room))
+        string roomQuery = opt.Room ?? Ask("Введите номер кабинета: ");
+        if (string.IsNullOrWhiteSpace(roomQuery))
         {
             Console.Error.WriteLine("Номер кабинета не задан.");
             return 2;
         }
 
-        var nowTime = TimeOnly.FromDateTime(options.At ?? DateTime.Now);
+        var moment = opt.At ?? DateTime.Now;
+        var nowTime = TimeOnly.FromDateTime(moment);
 
-        using HttpClient http = CreateClient();
+        using var client = new SmtuClient();
 
+        // --- Страница со списком: текущая неделя и карта аудиторий. ---
         string listHtml;
         try
         {
-            listHtml = await GetHtml(http, ListUrl);
+            listHtml = await client.GetListScheduleAsync();
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Не удалось загрузить {ListUrl}: {ex.Message}");
+            Console.Error.WriteLine($"Не удалось загрузить список расписаний: {ex.Message}");
             return 1;
         }
 
-        (DayOfWeek? today, WeekKind? parity) = ParseToday(listHtml);
-        WeekKind currentParity = options.Week ?? parity ?? WeekKind.Both;
-        DayOfWeek currentDay = options.At?.DayOfWeek ?? today ?? DateTime.Now.DayOfWeek;
+        var (siteDay, siteWeek) = ScheduleParser.ParseTodayLine(listHtml);
+        WeekKind week = opt.Week ?? siteWeek ?? WeekKind.Both;
+        DayOfWeek day = opt.At?.DayOfWeek ?? siteDay ?? moment.DayOfWeek;
 
-        List<RoomRef> rooms = ParseRooms(listHtml);
+        List<Room> rooms = ScheduleParser.ParseRooms(listHtml);
         if (rooms.Count == 0)
         {
-            Console.Error.WriteLine("Не удалось разобрать список аудиторий (изменилась разметка сайта?).");
+            Console.Error.WriteLine("Не удалось разобрать список аудиторий (возможно, изменилась разметка сайта).");
             return 1;
         }
 
-        var matches = FindRooms(rooms, room, options.Building);
+        List<Room> matches = RoomFinder.Find(rooms, roomQuery, opt.Building);
         if (matches.Count == 0)
         {
-            Console.Error.WriteLine($"Аудитория «{room}» не найдена. Примеры доступных: " +
+            Console.Error.WriteLine($"Аудитория «{roomQuery}» не найдена.");
+            Console.Error.WriteLine("Примеры доступных: " +
                 string.Join(", ", rooms.Take(15).Select(r => $"{r.Title} ({r.Building})")) + " …");
             return 1;
         }
 
-        Console.WriteLine($"Кабинет:       {room}");
-        Console.WriteLine($"Сейчас:        {(options.At ?? DateTime.Now):dd.MM.yyyy HH:mm}, " +
-                          $"{DayName(currentDay)}, {ParityName(currentParity)}");
+        Console.WriteLine($"Кабинет:       {roomQuery}");
+        Console.WriteLine($"Момент:        {moment:dd.MM.yyyy HH:mm}, {Ru.DayName(day)}, {Ru.WeekName(week)}");
         Console.WriteLine();
 
-        foreach (var rm in matches)
+        // --- По каждой подходящей аудитории смотрим расписание. ---
+        foreach (var room in matches)
         {
             string html;
             try
             {
-                html = await GetHtml(http, rm.Url);
+                html = await client.GetAsync(room.ScheduleUrl);
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"  ! {rm.Title} ({rm.Building}): {ex.Message}");
+                Console.Error.WriteLine($"  ! {room.Title} ({room.Building}): {ex.Message}");
                 continue;
             }
 
-            var lessons = ParseRoomSchedule(html);
+            List<Lesson> lessons = ScheduleParser.ParseRoomSchedule(html);
+            string header = matches.Count > 1
+                ? $"Аудитория {room.Title} ({room.Building})"
+                : $"Аудитория {room.Title}";
 
-            if (options.Dump)
+            if (opt.Dump)
             {
-                Console.WriteLine($"=== {rm.Title} ({rm.Building}) — {rm.Url}");
+                Console.WriteLine($"=== {header} — {room.ScheduleUrl}");
                 foreach (var l in lessons.OrderBy(l => l.Day).ThenBy(l => l.Start))
-                    Console.WriteLine($"  {DayName(l.Day)} {l.Start:HH\\:mm}-{l.End:HH\\:mm} " +
-                                      $"{ParityName(l.Week)} | гр.{l.Group} | {l.Subject} ({l.Type}) | {l.Teacher}");
+                    Console.WriteLine($"  {Ru.DayName(l.Day),-12} {l.Start:HH\\:mm}-{l.End:HH\\:mm} " +
+                                      $"{Ru.WeekName(l.Week),-14} гр.{l.Group,-7} {l.Subject} " +
+                                      $"({l.Type}) — {l.Teacher}");
+                Console.WriteLine();
                 continue;
             }
 
-            var now = lessons.Where(l =>
-                l.Day == currentDay &&
-                nowTime >= l.Start && nowTime <= l.End &&
-                (l.Week == WeekKind.Both || l.Week == currentParity)).ToList();
+            var current = lessons
+                .Where(l => l.Day == day
+                            && nowTime >= l.Start && nowTime <= l.End
+                            && (l.Week == WeekKind.Both || l.Week == week))
+                .ToList();
 
-            string header = matches.Count > 1 ? $"Аудитория {rm.Title} ({rm.Building})" : $"Аудитория {rm.Title}";
-            if (now.Count == 0)
+            if (current.Count == 0)
             {
                 Console.WriteLine($"{header}: сейчас занятий нет.");
                 Console.WriteLine();
@@ -149,12 +160,13 @@ internal static class Program
             }
 
             Console.WriteLine($"{header} — сейчас идёт:");
-            foreach (var l in now)
+            foreach (var l in current)
             {
                 Console.WriteLine($"  Время:         {l.Start:HH\\:mm}-{l.End:HH\\:mm}");
-                Console.WriteLine($"  Предмет:       {Dash(l.Subject)}{(l.Type.Length > 0 ? $" ({l.Type})" : "")}");
-                Console.WriteLine($"  Преподаватель: {Dash(l.Teacher)}");
-                Console.WriteLine($"  Группа:        {Dash(l.Group)}");
+                Console.WriteLine($"  Предмет:       {Ru.OrDash(l.Subject)}" +
+                                  (l.Type.Length > 0 ? $" ({l.Type})" : ""));
+                Console.WriteLine($"  Преподаватель: {Ru.OrDash(l.Teacher)}");
+                Console.WriteLine($"  Группа:        {Ru.OrDash(l.Group)}");
                 Console.WriteLine();
             }
         }
@@ -162,157 +174,185 @@ internal static class Program
         return 0;
     }
 
-    // ---------- HTTP ----------
-
-    private static HttpClient CreateClient()
+    private static string Ask(string prompt)
     {
-        var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
-        {
-            Timeout = TimeSpan.FromSeconds(30)
-        };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
-        http.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,*/*;q=0.8");
-        http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("ru-RU,ru;q=0.9,en;q=0.8");
-        return http;
+        Console.Write(prompt);
+        return Console.ReadLine()?.Trim() ?? "";
     }
 
-    private static async Task<string> GetHtml(HttpClient http, string url)
+    private static void WaitForKey()
     {
-        using var resp = await http.GetAsync(url);
+        try
+        {
+            Console.WriteLine();
+            Console.Write("Нажмите любую клавишу для выхода…");
+            Console.ReadKey(intercept: true);
+        }
+        catch { /* ввод недоступен */ }
+    }
+}
+
+/// <summary>HTTP-клиент к сайту СПбГМТУ с браузерными заголовками.</summary>
+internal sealed class SmtuClient : IDisposable
+{
+    public const string BaseUrl = "https://www.smtu.ru";
+    private const string ListUrl = BaseUrl + "/ru/listschedule/";
+
+    private readonly HttpClient _http;
+
+    public SmtuClient()
+    {
+        _http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
+        {
+            Timeout = TimeSpan.FromSeconds(30),
+        };
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+        _http.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,*/*;q=0.8");
+        _http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("ru-RU,ru;q=0.9,en;q=0.8");
+    }
+
+    public Task<string> GetListScheduleAsync() => GetAsync(ListUrl);
+
+    public async Task<string> GetAsync(string url)
+    {
+        using var resp = await _http.GetAsync(url);
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStringAsync();
     }
 
-    // ---------- Разбор списка аудиторий (arRoom) и текущей недели ----------
+    public void Dispose() => _http.Dispose();
+}
 
-    private sealed class BuildingJson
+/// <summary>Разбор HTML-страниц расписания.</summary>
+internal static class ScheduleParser
+{
+    // --- Список аудиторий: JSON-объект var arRoom = { "1": { building_title, ar: {...} }, ... } ---
+
+    private sealed class BuildingDto
     {
         [JsonPropertyName("building_title")] public string Title { get; set; } = "";
-        [JsonPropertyName("ar")] public Dictionary<string, RoomJson> Rooms { get; set; } = new();
+        [JsonPropertyName("ar")] public Dictionary<string, RoomDto> Rooms { get; set; } = new();
     }
 
-    private sealed class RoomJson
+    private sealed class RoomDto
     {
         [JsonPropertyName("title")] public string Title { get; set; } = "";
         [JsonPropertyName("hex")] public string Hex { get; set; } = "";
     }
 
-    private static List<RoomRef> ParseRooms(string html)
+    public static List<Room> ParseRooms(string html)
     {
-        var result = new List<RoomRef>();
-        string? json = ExtractArRoom(html);
-        if (json is null) return result;
+        var rooms = new List<Room>();
+        string? json = ExtractArRoomJson(html);
+        if (json is null) return rooms;
 
-        Dictionary<string, BuildingJson>? buildings;
+        Dictionary<string, BuildingDto>? buildings;
         try
         {
-            buildings = JsonSerializer.Deserialize<Dictionary<string, BuildingJson>>(
-                json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            buildings = JsonSerializer.Deserialize<Dictionary<string, BuildingDto>>(json);
         }
-        catch
+        catch (JsonException)
         {
-            return result;
+            return rooms;
         }
-        if (buildings is null) return result;
+        if (buildings is null) return rooms;
 
         foreach (var b in buildings.Values)
-            foreach (var (roomId, info) in b.Rooms)
-                result.Add(new RoomRef(b.Title, roomId, info.Title, info.Hex));
+            foreach (var (id, dto) in b.Rooms)
+                rooms.Add(new Room(b.Title, id, dto.Title, dto.Hex));
 
-        return result;
+        return rooms;
     }
 
-    // Достаёт JSON-объект из `var arRoom = {...};` балансировкой скобок.
-    private static string? ExtractArRoom(string html)
+    // Вырезает тело объекта из `var arRoom = {...};` по балансу фигурных скобок.
+    private static string? ExtractArRoomJson(string html)
     {
-        int marker = html.IndexOf("arRoom", StringComparison.Ordinal);
-        if (marker < 0) return null;
-        int start = html.IndexOf('{', marker);
+        int at = html.IndexOf("arRoom", StringComparison.Ordinal);
+        if (at < 0) return null;
+        int start = html.IndexOf('{', at);
         if (start < 0) return null;
 
         int depth = 0;
         for (int i = start; i < html.Length; i++)
         {
-            if (html[i] == '{') depth++;
-            else if (html[i] == '}' && --depth == 0)
+            char c = html[i];
+            if (c == '{') depth++;
+            else if (c == '}' && --depth == 0)
                 return html.Substring(start, i - start + 1);
         }
         return null;
     }
 
-    private static (DayOfWeek? Day, WeekKind? Parity) ParseToday(string html)
+    // --- Строка «Сегодня: 27 Мая 2026 года, Среда, нижняя неделя» ---
+
+    public static (DayOfWeek? Day, WeekKind? Week) ParseTodayLine(string html)
     {
         var m = Regex.Match(html, @"Сегодня:[^<]*");
         string s = m.Success ? m.Value : "";
 
-        DayOfWeek? day = ParseDay(s);
-        WeekKind? parity = Regex.IsMatch(s, "верхн", RegexOptions.IgnoreCase) ? WeekKind.Up
-            : Regex.IsMatch(s, "нижн", RegexOptions.IgnoreCase) ? WeekKind.Down
-            : null;
-        return (day, parity);
+        DayOfWeek? day = Ru.ParseDay(s);
+        WeekKind? week =
+            Regex.IsMatch(s, "верхн", RegexOptions.IgnoreCase) ? WeekKind.Up :
+            Regex.IsMatch(s, "нижн", RegexOptions.IgnoreCase) ? WeekKind.Down :
+            null;
+        return (day, week);
     }
 
-    private static List<RoomRef> FindRooms(List<RoomRef> rooms, string query, string? building)
-    {
-        IEnumerable<RoomRef> pool = rooms;
-        if (!string.IsNullOrWhiteSpace(building))
-            pool = pool.Where(r => Norm(r.Building).Contains(Norm(building)));
-
-        var pooled = pool.ToList();
-        string q = Norm(query);
-
-        var exact = pooled.Where(r => Norm(r.Title) == q).ToList();
-        if (exact.Count > 0) return exact;
-
-        return pooled.Where(r => Norm(r.Title).StartsWith(q) || Norm(r.Title).Contains(q)).ToList();
-    }
-
-    // ---------- Разбор расписания аудитории (табличный вид) ----------
+    // --- Расписание аудитории (табличный вид #table-container) ---
     //
-    // Берём фрагмент страницы начиная с id="table-container" (вид-таблица идёт
-    // в разметке после вида-карточек, поэтому карточки в выборку не попадают),
-    // затем по порядку идём по заголовкам дней и строкам занятий.
+    // Структура: на каждый день карточка с заголовком <h3 class="h5 my-0">День</h3>,
+    // внутри таблица; каждое занятие — строка <tr id="week-{up|down|both}-container">
+    // с ячейками: th=время, td0=иконка недели, td1=аудитория, td2=группа,
+    // td3=предмет+тип, td4=преподаватель.
 
-    private static readonly Regex DayOrRow = new(
+    private static readonly Regex DayHeaderOrRow = new(
         @"<h3\s+class=""h5 my-0"">(?<day>[^<]+)</h3>" +
-        @"|<tr[^>]*id=""week-(?<week>up|down|both)-container""[^>]*>(?<body>.*?)</tr>",
+        @"|<tr[^>]*\bid=""week-(?<week>up|down|both)-container""[^>]*>(?<row>.*?)</tr>",
         RegexOptions.Singleline | RegexOptions.Compiled);
 
-    private static readonly Regex CellTd = new(@"<td\b[^>]*>(.*?)</td>", RegexOptions.Singleline | RegexOptions.Compiled);
-    private static readonly Regex CellTh = new(@"<th\b[^>]*>(.*?)</th>", RegexOptions.Singleline | RegexOptions.Compiled);
-    private static readonly Regex SpanIn = new(@"<span\b[^>]*>(.*?)</span>", RegexOptions.Singleline | RegexOptions.Compiled);
-    private static readonly Regex SmallMuted = new(@"<small\b[^>]*class=""[^""]*text-muted[^""]*""[^>]*>(.*?)</small>", RegexOptions.Singleline | RegexOptions.Compiled);
-    private static readonly Regex TimeRange = new(@"(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})", RegexOptions.Compiled);
+    private static readonly Regex ThCell = new(@"<th\b[^>]*>(.*?)</th>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex TdCell = new(@"<td\b[^>]*>(.*?)</td>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex InnerSpan = new(@"<span\b[^>]*>(.*?)</span>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex MutedSmall = new(
+        @"<small\b[^>]*class=""[^""]*text-muted[^""]*""[^>]*>(.*?)</small>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex TimeRange = new(
+        @"(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})", RegexOptions.Compiled);
 
-    private static List<Lesson> ParseRoomSchedule(string html)
+    public static List<Lesson> ParseRoomSchedule(string html)
     {
         var lessons = new List<Lesson>();
 
-        int tableStart = html.IndexOf("id=\"table-container\"", StringComparison.Ordinal);
-        string scope = tableStart >= 0 ? html[tableStart..] : html;
+        // Работаем только с табличным видом: он идёт после вида-карточек,
+        // поэтому карточки в выборку не попадают и дублей не будет.
+        int tableAt = html.IndexOf("id=\"table-container\"", StringComparison.Ordinal);
+        string scope = tableAt >= 0 ? html[tableAt..] : html;
 
-        DayOfWeek? currentDay = null;
-        foreach (Match m in DayOrRow.Matches(scope))
+        DayOfWeek? day = null;
+        foreach (Match m in DayHeaderOrRow.Matches(scope))
         {
             if (m.Groups["day"].Success)
             {
-                currentDay = ParseDay(Text(m.Groups["day"].Value));
+                day = Ru.ParseDay(Html.Text(m.Groups["day"].Value));
                 continue;
             }
-            if (currentDay is null) continue;
+            if (day is null) continue;
 
-            string body = m.Groups["body"].Value;
+            string row = m.Groups["row"].Value;
 
-            var thm = CellTh.Match(body);
-            if (!thm.Success) continue;
-            var tm = TimeRange.Match(Text(thm.Groups[1].Value));
-            if (!tm.Success) continue;
-            var start = new TimeOnly(int.Parse(tm.Groups[1].Value), int.Parse(tm.Groups[2].Value));
-            var end = new TimeOnly(int.Parse(tm.Groups[3].Value), int.Parse(tm.Groups[4].Value));
+            var th = ThCell.Match(row);
+            if (!th.Success) continue;
+            var t = TimeRange.Match(Html.Text(th.Groups[1].Value));
+            if (!t.Success) continue;
+            var start = new TimeOnly(int.Parse(t.Groups[1].Value), int.Parse(t.Groups[2].Value));
+            var end = new TimeOnly(int.Parse(t.Groups[3].Value), int.Parse(t.Groups[4].Value));
 
-            var tds = CellTd.Matches(body);
+            var tds = TdCell.Matches(row);
             if (tds.Count < 5) continue;
 
             WeekKind week = m.Groups["week"].Value switch
@@ -322,28 +362,77 @@ internal static class Program
                 _ => WeekKind.Both,
             };
 
-            string roomTitle = Text(tds[1].Groups[1].Value);
-            string group = Text(tds[2].Groups[1].Value);
+            string group = Html.Text(tds[2].Groups[1].Value);
 
-            string subjCell = tds[3].Groups[1].Value;
-            var sm = SpanIn.Match(subjCell);
-            string subject = Text(sm.Success ? sm.Groups[1].Value : subjCell);
-            var tym = SmallMuted.Match(subjCell);
-            string type = tym.Success ? Text(tym.Groups[1].Value) : "";
+            string subjectCell = tds[3].Groups[1].Value;
+            var span = InnerSpan.Match(subjectCell);
+            string subject = Html.Text(span.Success ? span.Groups[1].Value : subjectCell);
+            var typeM = MutedSmall.Match(subjectCell);
+            string type = typeM.Success ? Html.Text(typeM.Groups[1].Value) : "";
 
-            string teacher = Text(tds[4].Groups[1].Value);
+            string teacher = Html.Text(tds[4].Groups[1].Value);
 
-            lessons.Add(new Lesson(currentDay.Value, start, end, week, subject, type, group, teacher, roomTitle));
+            lessons.Add(new Lesson(day.Value, start, end, week, subject, type, group, teacher));
         }
 
         return lessons;
     }
+}
 
-    // ---------- Утилиты ----------
-
-    private static DayOfWeek? ParseDay(string text)
+/// <summary>Поиск аудитории по введённому номеру.</summary>
+internal static class RoomFinder
+{
+    public static List<Room> Find(List<Room> rooms, string query, string? building)
     {
-        string t = text.ToLowerInvariant();
+        IEnumerable<Room> pool = rooms;
+        if (!string.IsNullOrWhiteSpace(building))
+            pool = pool.Where(r => Key(r.Building).Contains(Key(building)));
+
+        var list = pool.ToList();
+        string q = Key(query);
+
+        var exact = list.Where(r => Key(r.Title) == q).ToList();
+        if (exact.Count > 0) return exact;
+
+        return list.Where(r => Key(r.Title).StartsWith(q) || Key(r.Title).Contains(q)).ToList();
+    }
+
+    // Нормализация для сравнения: без пробелов, в нижнем регистре.
+    private static string Key(string s) =>
+        new string((s ?? "").Where(c => !char.IsWhiteSpace(c)).ToArray()).ToLowerInvariant();
+}
+
+/// <summary>Очистка HTML: снятие тегов и декодирование сущностей.</summary>
+internal static class Html
+{
+    private static readonly Regex Tags = new("<[^>]+>", RegexOptions.Compiled);
+    private static readonly Regex Spaces = new(@"\s+", RegexOptions.Compiled);
+    private static readonly Regex NumEntity = new(@"&#(\d+);", RegexOptions.Compiled);
+
+    public static string Text(string html)
+    {
+        string s = Tags.Replace(html ?? "", " ");
+        s = Decode(s);
+        return Spaces.Replace(s, " ").Trim();
+    }
+
+    private static string Decode(string s)
+    {
+        s = s.Replace("&nbsp;", " ").Replace("&amp;", "&").Replace("&quot;", "\"")
+             .Replace("&laquo;", "«").Replace("&raquo;", "»")
+             .Replace("&mdash;", "—").Replace("&ndash;", "–")
+             .Replace("&#39;", "'").Replace("&apos;", "'")
+             .Replace("&lt;", "<").Replace("&gt;", ">");
+        return NumEntity.Replace(s, m => ((char)int.Parse(m.Groups[1].Value)).ToString());
+    }
+}
+
+/// <summary>Русские названия дней/недель и разбор дня недели из текста.</summary>
+internal static class Ru
+{
+    public static DayOfWeek? ParseDay(string text)
+    {
+        string t = (text ?? "").ToLowerInvariant();
         if (t.Contains("понедельник")) return DayOfWeek.Monday;
         if (t.Contains("вторник")) return DayOfWeek.Tuesday;
         if (t.Contains("сред")) return DayOfWeek.Wednesday;
@@ -354,7 +443,7 @@ internal static class Program
         return null;
     }
 
-    private static string DayName(DayOfWeek d) => d switch
+    public static string DayName(DayOfWeek d) => d switch
     {
         DayOfWeek.Monday => "понедельник",
         DayOfWeek.Tuesday => "вторник",
@@ -365,67 +454,56 @@ internal static class Program
         _ => "воскресенье",
     };
 
-    private static string ParityName(WeekKind w) => w switch
+    public static string WeekName(WeekKind w) => w switch
     {
         WeekKind.Up => "верхняя неделя",
         WeekKind.Down => "нижняя неделя",
         _ => "обе недели",
     };
 
-    private static string Norm(string s) => Clean(s).Replace(" ", "").ToLowerInvariant();
+    public static string OrDash(string s) => string.IsNullOrWhiteSpace(s) ? "—" : s;
+}
 
-    // Снимает теги и декодирует HTML-сущности, нормализует пробелы.
-    private static string Text(string html) => Clean(Decode(Regex.Replace(html ?? "", "<[^>]+>", " ")));
+/// <summary>Разбор аргументов командной строки.</summary>
+internal sealed class CliOptions
+{
+    public string? Room { get; private set; }
+    public string? Building { get; private set; }
+    public bool Dump { get; private set; }
+    public DateTime? At { get; private set; }
+    public WeekKind? Week { get; private set; }
 
-    private static string Decode(string s)
+    public static CliOptions Parse(string[] args)
     {
-        s = s.Replace("&nbsp;", " ").Replace("&amp;", "&").Replace("&quot;", "\"")
-             .Replace("&laquo;", "«").Replace("&raquo;", "»").Replace("&mdash;", "—")
-             .Replace("&ndash;", "–").Replace("&#39;", "'").Replace("&apos;", "'")
-             .Replace("&lt;", "<").Replace("&gt;", ">");
-        return Regex.Replace(s, @"&#(\d+);", m => ((char)int.Parse(m.Groups[1].Value)).ToString());
-    }
+        var o = new CliOptions();
+        var ru = CultureInfo.GetCultureInfo("ru-RU");
+        var rest = new List<string>();
 
-    private static string Clean(string s) => Regex.Replace(s ?? "", @"\s+", " ").Trim();
-
-    private static string Dash(string s) => string.IsNullOrWhiteSpace(s) ? "—" : s;
-
-    private static string Prompt(string message)
-    {
-        Console.Write(message);
-        return Console.ReadLine()?.Trim() ?? "";
-    }
-
-    private sealed class Options
-    {
-        public string? Room;
-        public string? Building;
-        public bool Dump;
-        public DateTime? At;
-        public WeekKind? Week;
-
-        public static Options Parse(string[] args)
+        foreach (string arg in args)
         {
-            var o = new Options();
-            var rest = new List<string>();
-            foreach (var arg in args)
+            if (arg is "--dump" or "-d")
+                o.Dump = true;
+            else if (arg.StartsWith("--building=", StringComparison.Ordinal))
+                o.Building = arg["--building=".Length..];
+            else if (arg is "--week=up" or "--week=верх")
+                o.Week = WeekKind.Up;
+            else if (arg is "--week=down" or "--week=ниж")
+                o.Week = WeekKind.Down;
+            else if (arg.StartsWith("--at=", StringComparison.Ordinal))
             {
-                if (arg == "--dump") o.Dump = true;
-                else if (arg.StartsWith("--building=")) o.Building = arg["--building=".Length..];
-                else if (arg is "--week=up" or "--week=верх") o.Week = WeekKind.Up;
-                else if (arg is "--week=down" or "--week=ниж") o.Week = WeekKind.Down;
-                else if (arg.StartsWith("--at="))
-                {
-                    string v = arg["--at=".Length..];
-                    if (DateTime.TryParse(v, CultureInfo.GetCultureInfo("ru-RU"), DateTimeStyles.None, out var dt))
-                        o.At = dt;
-                    else if (TimeOnly.TryParse(v, CultureInfo.GetCultureInfo("ru-RU"), out var t))
-                        o.At = DateTime.Today.Add(t.ToTimeSpan());
-                }
-                else rest.Add(arg);
+                string v = arg["--at=".Length..];
+                if (DateTime.TryParse(v, ru, DateTimeStyles.None, out var dt))
+                    o.At = dt;
+                else if (TimeOnly.TryParse(v, ru, out var time))
+                    o.At = DateTime.Today.Add(time.ToTimeSpan());
             }
-            if (rest.Count > 0) o.Room = string.Join(' ', rest).Trim();
-            return o;
+            else
+                rest.Add(arg);
         }
+
+        if (rest.Count > 0)
+            o.Room = string.Join(' ', rest).Trim();
+
+        return o;
     }
 }
