@@ -96,6 +96,14 @@ internal static class Program
         // Разбираем аргументы командной строки в удобный объект.
         var opt = CliOptions.Parse(args);
 
+        // Режим журнала по явной группе (--group=NNNN): оценки/посещаемость
+        // без обращения к сайту — сразу открываем список этой группы.
+        if (opt.Group is not null)
+            return Journal.RunForGroup(opt, opt.Group, opt.Subject, opt.At ?? DateTime.Now);
+
+        // Запущено ли интерактивно (без аргументов) — тогда можем предложить журнал.
+        bool interactive = args.Length == 0;
+
         // Берём номер из --аргумента, либо спрашиваем у пользователя.
         // Оператор ?? — «если слева null, возьми справа».
         string roomQuery = opt.Room ?? Ask("Введите номер кабинета: ");
@@ -166,6 +174,10 @@ internal static class Program
         Console.WriteLine($"Момент:        {moment:dd.MM.yyyy HH:mm}, {Ru.DayName(day)}, {Ru.WeekName(week)}");
         Console.WriteLine();
 
+        // Сюда собираем (группа, предмет) по всем идущим сейчас занятиям —
+        // чтобы потом при желании открыть по ним журнал.
+        var foundForJournal = new List<(string Group, string Subject)>();
+
         // --- По каждой подходящей аудитории качаем её страницу и ищем текущее занятие ---
         foreach (var room in matches)
         {
@@ -235,6 +247,33 @@ internal static class Program
                 Console.WriteLine($"  Преподаватель: {Ru.OrDash(l.Teacher)}");
                 Console.WriteLine($"  Группа:        {Ru.OrDash(l.Group)}");
                 Console.WriteLine();
+
+                // Запоминаем группу и предмет — пригодятся для журнала.
+                if (!string.IsNullOrWhiteSpace(l.Group))
+                    foundForJournal.Add((l.Group, l.Subject));
+            }
+        }
+
+        // --- Журнал по найденной группе ---
+        // Открываем, если задан флаг --journal, либо (в интерактивном режиме)
+        // спрашиваем у пользователя по каждой найденной группе.
+        if (foundForJournal.Count > 0 && (opt.Journal || interactive))
+        {
+            // Уникальные группы (одно занятие — одна группа, но на всякий случай).
+            var groups = foundForJournal.DistinctBy(x => x.Group).ToList();
+
+            RosterStore? roster = null;
+            foreach (var (grp, subj) in groups)
+            {
+                // В интерактиве спрашиваем; с флагом --journal открываем без вопросов.
+                bool open = opt.Journal || AskYesNo($"Открыть журнал группы {grp}?");
+                if (!open) continue;
+
+                // Реестр грузим один раз — при первой реальной надобности.
+                roster ??= Journal.LoadRoster(opt.Roster);
+                if (roster is null) break; // не нашли файл — сообщение уже выведено
+
+                Journal.Run(roster, grp, subj, moment, opt.Out);
             }
         }
 
@@ -247,6 +286,14 @@ internal static class Program
     {
         Console.Write(prompt);
         return Console.ReadLine()?.Trim() ?? "";
+    }
+
+    // Вопрос «да/нет». Считаем ответом «да» строки, начинающиеся на д/y/1.
+    private static bool AskYesNo(string prompt)
+    {
+        Console.Write($"{prompt} (д/н): ");
+        string a = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+        return a.StartsWith('д') || a.StartsWith('y') || a == "1" || a == "+";
     }
 
     // Ждёт нажатия любой клавиши, чтобы консоль не закрылась мгновенно.
@@ -675,6 +722,13 @@ internal sealed class CliOptions
     public DateTime? At { get; private set; }      // момент времени (вместо «сейчас»)
     public WeekKind? Week { get; private set; }    // переопределение типа недели
 
+    // --- Параметры журнала оценок и посещаемости ---
+    public string? Roster { get; private set; }    // путь к файлу со списками групп
+    public string? Group { get; private set; }     // вести журнал сразу по этой группе (без сайта)
+    public bool Journal { get; private set; }       // открыть журнал для найденной группы
+    public string? Out { get; private set; }       // путь для сохранения CSV
+    public string? Subject { get; private set; }   // предмет (если задаём вручную)
+
     // Фабричный метод: принимает args, возвращает заполненный объект.
     public static CliOptions Parse(string[] args)
     {
@@ -704,6 +758,23 @@ internal sealed class CliOptions
             else if (arg is "--week=down" or "--week=ниж")
                 o.Week = WeekKind.Down;
 
+            // --- Журнал ---
+            // Открыть журнал для группы найденного занятия.
+            else if (arg is "--journal" or "-j")
+                o.Journal = true;
+            // Путь к файлу со списками групп (реестру).
+            else if (arg.StartsWith("--roster=", StringComparison.Ordinal))
+                o.Roster = arg["--roster=".Length..];
+            // Вести журнал сразу по указанной группе, без обращения к сайту.
+            else if (arg.StartsWith("--group=", StringComparison.Ordinal))
+                o.Group = arg["--group=".Length..];
+            // Куда сохранить CSV (по умолчанию — journal_<группа>_<дата>.csv).
+            else if (arg.StartsWith("--out=", StringComparison.Ordinal))
+                o.Out = arg["--out=".Length..];
+            // Название предмета вручную (когда работаем по --group без расписания).
+            else if (arg.StartsWith("--subject=", StringComparison.Ordinal))
+                o.Subject = arg["--subject=".Length..];
+
             // --at=ВРЕМЯ или --at=ДАТА_ВРЕМЯ.
             else if (arg.StartsWith("--at=", StringComparison.Ordinal))
             {
@@ -729,5 +800,299 @@ internal sealed class CliOptions
             o.Room = string.Join(' ', rest).Trim();
 
         return o;
+    }
+}
+
+// =============================================================================
+// СПИСКИ ГРУПП, ЖУРНАЛ ОЦЕНОК И ПОСЕЩАЕМОСТИ
+// =============================================================================
+
+/// <summary>Студент из списка группы.</summary>
+internal sealed record Student(string Group, string RecordId, string Name, string Track);
+
+/// <summary>Загрузка и хранение списков групп из файла-реестра.</summary>
+internal sealed class RosterStore
+{
+    // Группа → список её студентов.
+    private readonly Dictionary<string, List<Student>> _byGroup = new();
+
+    public int GroupCount => _byGroup.Count;
+    public int StudentCount => _byGroup.Values.Sum(v => v.Count);
+
+    // Список студентов группы (пустой список, если такой группы нет).
+    public List<Student> Group(string group) =>
+        _byGroup.TryGetValue(group.Trim(), out var list) ? list : new List<Student>();
+
+    // Разбирает файл-реестр. Формат строки (разделитель «;», 6 полей):
+    //   группа;внутр_id;зачётка;направление;;ФИО
+    // Кодировка определяется автоматически (UTF-8 или Windows-1251).
+    public static RosterStore Load(string path)
+    {
+        var store = new RosterStore();
+        string text = TextFiles.ReadAuto(path);
+
+        foreach (string raw in text.Split('\n'))
+        {
+            string line = raw.TrimEnd('\r');
+            if (line.Length == 0) continue;
+
+            string[] f = line.Split(';');
+            if (f.Length < 6) continue; // строка не в ожидаемом формате — пропускаем
+
+            string group = f[0].Trim();
+            string record = f[2].Trim();   // номер зачётки
+            string track = f[3].Trim();    // направление/подгруппа (Б, К, Б / Ц …)
+            string name = f[5].Trim();     // ФИО
+            if (group.Length == 0 || name.Length == 0) continue;
+
+            // Получаем (или создаём) список группы и добавляем студента.
+            if (!store._byGroup.TryGetValue(group, out var list))
+                store._byGroup[group] = list = new List<Student>();
+            list.Add(new Student(group, record, name, track));
+        }
+
+        return store;
+    }
+
+    // Ищет файл реестра: либо явный путь, либо типовые имена рядом с программой
+    // и в текущей рабочей папке.
+    public static string? FindRosterPath(string? explicitPath)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+            return File.Exists(explicitPath) ? explicitPath : null;
+
+        string[] names = { "roster.csv", "roster.txt", "all_gr_4.txt", "all_gr.txt", "groups.txt" };
+        string[] dirs = { Directory.GetCurrentDirectory(), AppContext.BaseDirectory };
+
+        foreach (string dir in dirs)
+            foreach (string name in names)
+            {
+                string p = Path.Combine(dir, name);
+                if (File.Exists(p)) return p;
+            }
+        return null;
+    }
+}
+
+/// <summary>Чтение текстового файла с автоопределением кодировки.</summary>
+internal static class TextFiles
+{
+    public static string ReadAuto(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+
+        // BOM UTF-8 (EF BB BF) — точно UTF-8.
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+
+        // Пробуем строго как UTF-8; если попадётся недопустимый байт — это
+        // не UTF-8, значит, считаем файл в Windows-1251 (как выгрузка с сайта).
+        try
+        {
+            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                .GetString(bytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            return Cp1251.Decode(bytes);
+        }
+    }
+}
+
+/// <summary>Декодировщик однобайтовой кодировки Windows-1251 (без внешних пакетов).</summary>
+internal static class Cp1251
+{
+    // Сопоставление байтов 0x80–0xBF с кодами Unicode.
+    // Диапазон 0xC0–0xFF — обычные буквы А..я — считается линейно.
+    private static readonly int[] High =
+    {
+        0x0402,0x0403,0x201A,0x0453,0x201E,0x2026,0x2020,0x2021, // 80–87
+        0x20AC,0x2030,0x0409,0x2039,0x040A,0x040C,0x040B,0x040F, // 88–8F
+        0x0452,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014, // 90–97
+        0x0098,0x2122,0x0459,0x203A,0x045A,0x045C,0x045B,0x045F, // 98–9F
+        0x00A0,0x040E,0x045E,0x0408,0x00A4,0x0490,0x00A6,0x00A7, // A0–A7
+        0x0401,0x00A9,0x0404,0x00AB,0x00AC,0x00AD,0x00AE,0x0407, // A8–AF (0xA8 → Ё)
+        0x00B0,0x00B1,0x0406,0x0456,0x0491,0x00B5,0x00B6,0x00B7, // B0–B7
+        0x0451,0x2116,0x0454,0x00BB,0x0458,0x0405,0x0455,0x0457, // B8–BF (0xB8 → ё, 0xB9 → №)
+    };
+
+    public static string Decode(byte[] bytes)
+    {
+        var sb = new StringBuilder(bytes.Length);
+        foreach (byte b in bytes)
+        {
+            if (b < 0x80) sb.Append((char)b);                       // ASCII как есть
+            else if (b >= 0xC0) sb.Append((char)(0x0410 + (b - 0xC0))); // А..я линейно
+            else sb.Append((char)High[b - 0x80]);                   // прочее — по таблице
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>Формирование строк CSV с корректным экранированием.</summary>
+internal static class Csv
+{
+    // Экранирует одно поле: если внутри есть разделитель, кавычка или перевод
+    // строки — оборачиваем в кавычки, а внутренние кавычки удваиваем.
+    public static string Field(string s)
+    {
+        s ??= "";
+        bool needQuotes = s.Contains(';') || s.Contains('"') || s.Contains('\n') || s.Contains('\r');
+        return needQuotes ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
+    }
+
+    // Собирает строку CSV из ячеек через разделитель «;».
+    public static string Row(params string[] cells) => string.Join(";", cells.Select(Field));
+}
+
+/// <summary>Интерактивный журнал: оценки и посещаемость с сохранением в CSV.</summary>
+internal sealed class Journal
+{
+    // Заголовок CSV-файла.
+    public const string Header =
+        "Дата;Группа;Зачетка;ФИО;Направление;Предмет;Оценка;Отсутствовал";
+
+    // Сценарий «по номеру группы»: находит и загружает реестр, ведёт журнал.
+    public static int RunForGroup(CliOptions opt, string group, string? subject, DateTime date)
+    {
+        RosterStore? roster = LoadRoster(opt.Roster);
+        if (roster is null) return 1;
+        return Run(roster, group, subject, date, opt.Out);
+    }
+
+    // Загрузка реестра с понятными сообщениями об ошибках. null — если не вышло.
+    public static RosterStore? LoadRoster(string? rosterOption)
+    {
+        string? path = RosterStore.FindRosterPath(rosterOption);
+        if (path is null)
+        {
+            Console.Error.WriteLine("Файл со списками групп не найден.");
+            Console.Error.WriteLine("Укажите его через --roster=ПУТЬ или положите рядом с программой " +
+                                    "под именем roster.csv / all_gr_4.txt.");
+            return null;
+        }
+
+        try
+        {
+            var roster = RosterStore.Load(path);
+            Console.Error.WriteLine($"Список групп: {path} (групп: {roster.GroupCount}, студентов: {roster.StudentCount}).");
+            return roster;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Не удалось прочитать список групп «{path}»: {ex.Message}");
+            return null;
+        }
+    }
+
+    // Интерактивный проход по студентам группы и сохранение результата.
+    public static int Run(RosterStore roster, string group, string? subject, DateTime date, string? outPath)
+    {
+        var students = roster.Group(group);
+        if (students.Count == 0)
+        {
+            Console.Error.WriteLine($"В списке нет группы «{group}».");
+            return 1;
+        }
+
+        // Предмет: из расписания/аргумента, либо спрашиваем.
+        string subj = subject ?? Ask("Предмет (можно оставить пустым): ");
+
+        Console.WriteLine();
+        Console.WriteLine($"Журнал группы {group}" + (subj.Length > 0 ? $" — {subj}" : "") +
+                          $"   ({date:dd.MM.yyyy})");
+        Console.WriteLine($"Студентов: {students.Count}.");
+        Console.WriteLine("Ввод: оценка 2–5 · «н» — отсутствует · Enter — пропустить · «q» — закончить.");
+        Console.WriteLine();
+
+        var marks = new List<(Student S, string Grade, bool Absent)>();
+        bool stop = false;
+
+        for (int i = 0; i < students.Count && !stop; i++)
+        {
+            Student s = students[i];
+            string label = $"{i + 1,3}. {s.Name}" + (s.Track.Length > 0 ? $" [{s.Track}]" : "");
+
+            // Цикл повтора, пока не получим корректный ввод для этого студента.
+            while (true)
+            {
+                Console.Write($"{label}: ");
+                string input = (Console.ReadLine() ?? "").Trim();
+
+                if (input.Length == 0) { marks.Add((s, "", false)); break; }   // пропуск
+                if (IsQuit(input)) { stop = true; break; }                      // закончить
+                if (IsAbsent(input)) { marks.Add((s, "", true)); break; }       // отсутствует
+                if (IsGrade(input)) { marks.Add((s, input, false)); break; }    // оценка
+
+                Console.WriteLine("   ? Введите 2–5, «н», Enter или «q».");
+            }
+        }
+
+        // Имя файла по умолчанию: journal_<группа>_<дата>.csv
+        string file = outPath ?? $"journal_{Safe(group)}_{date:yyyy-MM-dd}.csv";
+        try
+        {
+            Save(file, group, subj, date, marks);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Не удалось сохранить «{file}»: {ex.Message}");
+            return 1;
+        }
+
+        int graded = marks.Count(m => m.Grade.Length > 0);
+        int absent = marks.Count(m => m.Absent);
+        Console.WriteLine();
+        Console.WriteLine($"Сохранено: {file}");
+        Console.WriteLine($"Оценок: {graded}, отсутствовали: {absent}, записей: {marks.Count}.");
+        return 0;
+    }
+
+    // Запись в CSV. Если файл уже есть — дописываем строки (журнал накапливается
+    // по датам); новый файл создаём с BOM и строкой заголовка.
+    private static void Save(string file, string group, string subject, DateTime date,
+                             List<(Student S, string Grade, bool Absent)> marks)
+    {
+        bool exists = File.Exists(file) && new FileInfo(file).Length > 0;
+
+        using var stream = new FileStream(file, FileMode.Append, FileAccess.Write);
+        // BOM (encoderShouldEmitUTF8Identifier) добавляем только для нового файла —
+        // тогда Excel откроет кириллицу корректно.
+        using var writer = new StreamWriter(stream,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: !exists));
+
+        if (!exists)
+            writer.WriteLine(Header);
+
+        foreach (var (s, grade, absent) in marks)
+            writer.WriteLine(Csv.Row(
+                date.ToString("dd.MM.yyyy"),
+                group,
+                s.RecordId,
+                s.Name,
+                s.Track,
+                subject,
+                grade,
+                absent ? "да" : ""));
+    }
+
+    // «q» (в т.ч. в русской раскладке — «й») — закончить ввод.
+    private static bool IsQuit(string s) => s is "q" or "Q" or "й" or "Й";
+
+    // Метки отсутствия: разные удобные варианты.
+    private static bool IsAbsent(string s) =>
+        s is "н" or "Н" or "n" or "N" or "a" or "A" or "отс" or "-";
+
+    // Оценка — одна цифра от 2 до 5.
+    private static bool IsGrade(string s) => s.Length == 1 && s[0] >= '2' && s[0] <= '5';
+
+    // Делает имя файла безопасным: только буквы/цифры, остальное — «_».
+    private static string Safe(string s) =>
+        new string(s.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+
+    private static string Ask(string prompt)
+    {
+        Console.Write(prompt);
+        return (Console.ReadLine() ?? "").Trim();
     }
 }
